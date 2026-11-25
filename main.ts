@@ -1,13 +1,12 @@
 // Meridian Token Launch Radar — Node 22 entrypoint (standard library only, zero network).
-// Reads /input/snapshot.json (or --input), executes dashboard/model.js + lib/validation.ts,
-// validates all 7 scorer gate invariants, writes /output/board.json, /output/data.js,
-// copies dashboard/ and screenshots/, and builds /output/dossier.json.
+// Executes dashboard/model.js (which also runs live in the browser), validates all 7 scorer gates,
+// writes /output/board.json, /output/data.js (snapshot + main checksum only), copies dashboard/ &
+// screenshots/, and builds /output/dossier.json via vendor/makefun-board.ts.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runBootstrap, runOddsValidation, runValueValidation } from './lib/validation.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const require = createRequire(import.meta.url);
@@ -37,7 +36,10 @@ function auditZeroHardcoding(src: string, rankedRows: { slug: string; name: stri
   return { checked: rankedRows.length, found };
 }
 
-function validateBoardGate(boardRows: { rank: number; slug: string; name: string; implied_value_usd: number; farm_steps: string[] }[], snapshot: { protocols: { slug: string }[]; watchlist: string[] }): string | null {
+function validateBoardGate(
+  boardRows: { rank: number; slug: string; name: string; implied_value_usd: number; farm_steps: string[] }[],
+  snapshot: { protocols: { slug: string }[]; watchlist: string[] },
+): string | null {
   if (!Array.isArray(boardRows) || boardRows.length < 100 || boardRows.length > 4000) return 'bad row count';
   const snapSlugs = new Set(snapshot.protocols.map((p) => p.slug));
   const seen = new Set<string>();
@@ -72,19 +74,12 @@ if (!existsSync(inputFile)) {
 
 const outDir = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 const snapshot = JSON.parse(readFileSync(inputFile, 'utf8'));
-const uni = model.classifyUniverse(snapshot);
-const ch7s = snapshot.protocols.map((p: { change_7d: number | null }) => p.change_7d).filter((v: number | null) => v !== null);
-const med7d = model.median(ch7s);
-const valCheck = runValueValidation(model, uni.comps, snapshot.as_of, med7d);
-const oddsCheck = runOddsValidation(model, uni.peers, snapshot.as_of, med7d);
-const bootstrap = runBootstrap(model, uni.comps, uni.peers, uni.ranked, snapshot.as_of, med7d, 200);
-const pre = { valCheck, oddsCheck, bootstrap };
-const result = model.buildRadar(snapshot, pre);
+const result = model.buildRadar(snapshot);
 
 const boardRows = result.rows.map((r: any) => ({
   rank: r.rank, slug: r.slug, name: r.name, category: r.category, sector: r.sector, chains: r.chains,
-  tvl_usd: r.tvl_usd, change_7d: r.change_7d, mcap_usd: r.mcap_usd, listed_at: r.listed_at, gecko_id: r.gecko_id,
-  symbol: r.symbol, token_status: 'pre-token', tier: r.tier, age_days: r.age_days,
+  tvl_usd: r.tvl_usd, change_7d: r.change_7d, mcap_usd: r.mcap_usd, listed_at: r.listed_at,
+  gecko_id: r.gecko_id, symbol: r.symbol, token_status: 'pre-token', tier: r.tier, age_days: r.age_days,
   launch_value_usd: r.launch_value_usd, launch_odds_24m: Math.round(r.launch_odds * 1e4) / 1e4,
   implied_value_usd: r.implied_value_usd, p25_usd: r.p25_usd, p75_usd: r.p75_usd, p10_usd: r.p10_usd, p90_usd: r.p90_usd,
   rank_range: [r.rank_low, r.rank_high], farm_verdict: r.farm.verdict,
@@ -104,11 +99,10 @@ const hardcodeAudit = auditZeroHardcoding(modelSource, result.rows);
 mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: boardRows })}\n`);
 
+// Only the raw snapshot and main.ts verification digest go into data.js;
+// the browser refits every curve, ablation ladder, conformal band, and bootstrap live.
 const payload = {
   snapshot,
-  valCheck,
-  oddsCheck,
-  bootstrap,
   main_digest: {
     row_count: result.verification.rowCount,
     total_implied_usd: result.verification.totalImpliedUsd,
