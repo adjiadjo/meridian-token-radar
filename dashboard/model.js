@@ -1,8 +1,8 @@
-/* Meridian v3 — empirical pricing, log1p 24m launch hazard, blind validation, calibration & farm plans. */
+/* Meridian v4 — empirical launch pricing, log1p 24m hazard, blind validation, bootstrap SEs & farm plans. */
 (r=>{
 'use strict';
 const {log,exp,abs,round,max,min,sqrt,floor,ceil,imul}=Math;
-const MODEL_VERSION='meridian-3',DEFAULT_DROP=0.09,CAP_APR=0.01,TBILL_APR=0.04,HURDLE=25;
+const MODEL_VERSION='meridian-4',DEFAULT_DROP=0.09,TBILL_APR=0.04,HURDLE=25;
 const BRIDGES=new Set(['Bridge','Canonical Bridge']),STAKING=new Set(['Liquid Staking','Liquid Restaking','Restaked BTC']);
 const CEX=['Binance','Coinbase','Bybit','Kraken','Bitget','OKX','Bitfinex','Gemini'];
 const VER_RE=/\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/,WRAP_RE=/\b(wrapped|staked|staking)\b/i;
@@ -13,6 +13,7 @@ const DEF_FEE=[0.25,1.25,'gas'];
 const cmp=(a,b)=>a<b?-1:a>b?1:0,clamp=(v,lo,hi)=>v<lo?lo:v>hi?hi:v,rn=(x,k)=>round(x*k)/k;
 const zeros=d=>Array.from({length:d},()=>Array(d).fill(0)),sum=a=>a.reduce((s,x)=>s+x,0);
 const dot=(a,b)=>{let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s;};
+const sdOf=a=>{const mu=sum(a)/a.length;return sqrt(sum(a.map(v=>(v-mu)**2))/max(1,a.length-1));};
 const median=a=>{if(!a.length)return 0;const s=[...a].sort((x,y)=>x-y),m=s.length>>1;return s.length%2?s[m]:0.5*(s[m-1]+s[m]);};
 const cQuant=(a,q)=>{if(!a.length)return 0;const s=[...a].sort((x,y)=>x-y),n=s.length;return s[clamp((q<0.5?floor(q*(n+1)):ceil(q*(n+1)))-1,0,n-1)];};
 const fnv1a=s=>{let h=2166136261>>>0;for(let i=0;i<s.length;i++)h=imul(h^s.charCodeAt(i),16777619)>>>0;return h;};
@@ -126,15 +127,14 @@ function runValueValidation(comps,asOf,m7){
  return{ladder,compsCount:comps.length,wfSplit:[wfTr.length,wfTe.length],bands,looPredBySlug,honesty:{looWithin3:w3(kL),wfWithin3:w3(kW),looCov50:cov(kL,bands.q25,bands.q75),wfCov50:cov(kW,wfb.q25,wfb.q75),looCov80:cov(kL,bands.q10,bands.q90),wfCov80:cov(kW,wfb.q10,wfb.q90)}};
 }
 
-/** Blind 10-Fold & Walk-Forward ablation on launch-odds terms + OOF calibration curve + age cohorts. */
+/** Blind 10-Fold & Walk-Forward ablation on launch-odds terms + OOF ECE + age cohorts. */
 function runOddsValidation(peers,asOf,m7){
  const sorted=[...peers].sort((a,b)=>cmp(a.slug,b.slug)),dated=sorted.filter(p=>p.listed_at).sort((a,b)=>cmp(a.listed_at,b.listed_at)||cmp(a.slug,b.slug));
  const sp=floor(dated.length*0.6),wfTr=dated.slice(0,sp),wfTe=dated.slice(sp),full={age:1,cat:1,tvl:1,growth:1},oof=[];
  const score=(tr,te,cfg,out)=>{const fm=cfg.base?null:fitLaunchOdds(tr,asOf,m7,cfg),br=tr.filter(hasTok).length/tr.length;let b=0,a=0;for(const p of te){const pr=fm?fm.predictProb(p):br,y=hasTok(p)?1:0;b+=(pr-y)**2;if((pr>=0.5?1:0)===y)a++;if(out)out.push([pr,y]);}return[b,a];};
  const specs=[['base','Base rate of peers','baseline',{base:1}],['age','+ ln(1 + age) + undated','kept',{age:1}],['cat','+ sector/category EB share','kept',{age:1,cat:1}],['tvl','+ size (ln TVL)','kept',{age:1,cat:1,tvl:1}],['growth','+ 7-day excess TVL growth','kept',full],['chains','+ chain count (ln)','tested, not kept',{...full,chains:1}],['placebo','+ control: 3-hash slug noise','must not help',{...full,placebo:1}]];
  const ladder=specs.map(([id,label,status,cfg])=>{
-  let b1=0,a1=0;
-  for(let f=0;f<10;f++){const[b,a]=score(sorted.filter((_,i)=>i%10!==f),sorted.filter((_,i)=>i%10===f),cfg,id==='growth'?oof:null);b1+=b;a1+=a;}
+  let b1=0,a1=0;for(let f=0;f<10;f++){const[b,a]=score(sorted.filter((_,i)=>i%10!==f),sorted.filter((_,i)=>i%10===f),cfg,id==='growth'?oof:null);b1+=b;a1+=a;}
   const[bW,aW]=score(wfTr,wfTe,cfg);
   return{id,label,status,cvBrier:rn(b1/sorted.length,1e4),cvAcc:rn(a1/sorted.length,1e3),wfBrier:rn(bW/wfTe.length,1e4),wfAcc:rn(aW/wfTe.length,1e3)};
  });
@@ -146,18 +146,18 @@ function runOddsValidation(peers,asOf,m7){
  return{ladder,peersCount:sorted.length,datedCount:dated.length,bins,ece,cohorts:cohorts.map(c=>({label:c.label,n:c.n,k:c.k,rate:c.n?rn(c.k/c.n,1e3):0}))};
 }
 
-/** 200-refit deterministic bootstrap for curve slope SE and 90% rank-stability intervals. */
+/** 200-refit deterministic bootstrap for value + odds coefficient SEs and 90% rank intervals. */
 function runBootstrap(comps,peers,ranked,asOf,m7,B=200){
- const rng=rng32(0x5eed2026),nC=comps.length,nP=peers.length,betas=[],hist=Object.fromEntries(ranked.map(x=>[x.slug,[]]));
+ const rng=rng32(0x5eed2026),nC=comps.length,nP=peers.length,vB=[],oA=[],oC=[],oT=[],oG=[],hist=Object.fromEntries(ranked.map(x=>[x.slug,[]]));
  for(let b=0;b<B;b++){
   const vc=fitSizeCurve(Array.from({length:nC},()=>comps[floor(rng()*nC)]),m7,true),oc=fitLaunchOdds(Array.from({length:nP},()=>peers[floor(rng()*nP)]),asOf,m7);
-  betas.push(vc.betaTvl);
+  vB.push(vc.betaTvl);oA.push(oc.beta[1]);oC.push(oc.beta[3]);oT.push(oc.beta[4]);oG.push(oc.beta[5]);
   const sc=ranked.map(p=>({slug:p.slug,val:exp(vc.predictLog(p.tvl_usd,p.change_7d))*oc.conditionalOdds(p,2).odds})).sort((a,c)=>c.val-a.val||cmp(a.slug,c.slug));
   for(let i=0;i<sc.length;i++)hist[sc[i].slug].push(i+1);
  }
- const mu=sum(betas)/betas.length,seBeta=sqrt(sum(betas.map(b=>(b-mu)**2))/max(1,betas.length-1)),rankRangeBySlug={};
+ const rankRangeBySlug={};
  for(const x of ranked){const h=hist[x.slug].sort((a,c)=>a-c);rankRangeBySlug[x.slug]=[h[floor(h.length*0.05)],h[min(h.length-1,floor(h.length*0.95))]];}
- return{refits:B,seBeta:rn(seBeta,1e3),rankRangeBySlug};
+ return{refits:B,seBeta:rn(sdOf(vB),1e3),seAge:rn(sdOf(oA),1e2),seCat:rn(sdOf(oC),1e2),seTvl:rn(sdOf(oT),1e2),seGr:rn(sdOf(oG),1e2),rankRangeBySlug};
 }
 
 function pickExecutionChain(ch){
@@ -170,20 +170,23 @@ const playKindOf=cat=>{const c=(cat||'').toLowerCase();return/curator|allocator/
 const fmtUsd=v=>{const a=abs(v),s=v<0?'-':'';return a>=1e9?`${s}$${(a/1e9).toFixed(2)}B`:a>=1e6?`${s}$${(a/1e6).toFixed(1)}M`:a>=1e3?`${s}$${round(a).toLocaleString('en-US')}`:`${s}$${a.toFixed(a<10?2:0)}`;};
 const fmtMoney2=v=>{const a=abs(v),s=v<0?'-':'';return a>=1e3?`${s}$${round(a).toLocaleString('en-US')}`:a>=100?`${s}$${a.toFixed(0)}`:`${s}$${a.toFixed(2)}`;};
 
+/** Evaluate one farm scenario: cash fees netted; 4% T-bill ref shown; strict positive-net verdicts. */
 function evaluateFarmScenario(row,o={}){
- const capital=o.capital>0?o.capital:5000,dropShare=o.dropShare||DEFAULT_DROP,apr=o.dragApr??CAP_APR,weeks=o.weeks||12,holdDays=weeks*7;
+ const capital=o.capital>0?o.capital:10000,dropShare=o.dropShare||DEFAULT_DROP,weeks=o.weeks||12,holdDays=weeks*7;
  const ex=pickExecutionChain(row.chains),[txGas,bIn,gasSym]=ex.fee,stepCosts=[rn(max(0.5,txGas+0.5),100),bIn,rn(txGas*3,100),rn(txGas*2,100),rn(txGas*weeks,100),rn(txGas*2+bIn,100)];
- const cashFees=rn(sum(stepCosts),100),totalMin=66+weeks*3,hours=totalMin/60,yr=holdDays/365,capitalCharge=capital*apr*yr,tbillBench=capital*TBILL_APR*yr,totalCost=cashFees+capitalCharge;
+ const cashFees=rn(sum(stepCosts),100),totalMin=66+weeks*3,hours=totalMin/60,tbillBench=capital*TBILL_APR*(holdDays/365);
  const tw=clamp(holdDays/min(180,max(42,(row.age_days||140)*0.22+holdDays)),0.38,1),sh=capital/(row.tvl_usd+capital),expectedDrop=row.implied_value_usd*dropShare*sh*tw,dropIfLaunches=row.launch_value_usd*dropShare*sh*tw;
- const netAllIn=expectedDrop-totalCost,netPerHour=netAllIn/hours,verdict=netAllIn>0&&netPerHour>=HURDLE?'FARM':netAllIn>0?'MARGINAL':'SKIP',dpd=expectedDrop/capital;
- return{chain:ex.chain,gasSym,txGas,capital,dropShare,weeks,holdDays,expectedDrop,dropIfLaunches,cashFees,capitalCharge,tbillBench,totalCost,netAllIn,totalMin,hours,netPerHour,verdict,breakEvenDrop:row.implied_value_usd>0?totalCost/max(1e-9,row.implied_value_usd*sh*tw):1,breakEvenOdds:dropIfLaunches>0?totalCost/dropIfLaunches:1,breakEvenDeposit:dpd>apr*yr?ceil(cashFees/(dpd-apr*yr)):null,stepCosts};
+ const netAllIn=expectedDrop-cashFees,netPerHour=netAllIn/hours,verdict=netAllIn>0&&netPerHour>=HURDLE?'FARM':netAllIn>0?'MARGINAL':'SKIP',dpd=expectedDrop/capital;
+ return{chain:ex.chain,gasSym,txGas,capital,dropShare,weeks,holdDays,expectedDrop,dropIfLaunches,cashFees,tbillBench,totalCost:cashFees,netAllIn,totalMin,hours,netPerHour,verdict,breakEvenDrop:row.implied_value_usd>0?cashFees/max(1e-9,row.implied_value_usd*sh*tw):1,breakEvenOdds:dropIfLaunches>0?cashFees/dropIfLaunches:1,breakEvenDeposit:dpd>0?ceil(cashFees/dpd):null,stepCosts};
 }
+
+/** Size deposit to plan scale (0.02% TVL, $1K-$100K): smallest capital clearing FARM, else best $/h. */
 function optimalFarmScenario(row,o={}){
- const dropShare=o.dropShare||DEFAULT_DROP,dragApr=o.dragApr??CAP_APR,maxCap=min(25000,max(2000,round((row.tvl_usd*0.0005)/500)*500));
- const caps=o.capital>0?[o.capital]:[1000,2500,5000,10000,15000,25000].filter(c=>c<=maxCap),wks=o.weeks>0?[o.weeks]:[6,8,12,16,20,26];
- let bF=null,bA=null;
- for(const capital of(caps.length?caps:[2000]))for(const weeks of wks){
-  const ev=evaluateFarmScenario(row,{capital,dropShare,dragApr,weeks});
+ const dropShare=o.dropShare||DEFAULT_DROP,planCap=clamp(round((row.tvl_usd*0.0002)/500)*500,1000,100000);
+ const caps=o.capital>0?[o.capital]:[...new Set([1000,2500,5000,10000,25000,50000,100000].filter(c=>c<=planCap).concat([planCap]))].sort((a,b)=>a-b);
+ const wks=o.weeks>0?[o.weeks]:[6,8,12,16,20,26];let bF=null,bA=null;
+ for(const capital of caps)for(const weeks of wks){
+  const ev=evaluateFarmScenario(row,{capital,dropShare,weeks});
   if(ev.verdict==='FARM'&&(!bF||ev.capital<bF.capital||(ev.capital===bF.capital&&ev.netPerHour>bF.netPerHour)))bF=ev;
   if(!bA||ev.netPerHour>bA.netPerHour)bA=ev;
  }
@@ -207,7 +210,7 @@ function buildFarmPlan(row,scIn){
   S('Day 2 · Deepen','Qualifying footprint',sec?`Hold un-looped; add one touch on ${sec} for multi-chain credit.`:'Hold un-looped; confirm points on the official rewards page.',F(c[3]),8),
   S(`Weekly ×${sc.weeks}`,'Active cadence',`Touch position weekly for ${sc.weeks}w (top-up, harvest, or vote) across ${sc.weeks} epochs.`,F(c[4]),sc.weeks*3),
   S('Any day · Risk','Drawdown exit',`Exit early if TVL drops 25% to ${exitTvl} (7d ${ch7}), queues > 7d, or snapshot lands.`,F(c[5]),10),
-  S(`Day ${sc.holdDays} · Claim`,'Unwind & budget',`Log hashes & ${cap} basis; unwind Day ${sc.holdDays}, claim via official link. Net ${F(sc.netAllIn)} (${F(sc.netPerHour)}/h; 4% T-bill ${F(sc.tbillBench)}).`,`${F(sc.capitalCharge)} spread`,8),
+  S(`Day ${sc.holdDays} · Claim`,'Unwind & budget',`Log hashes & ${cap} basis; unwind Day ${sc.holdDays}, claim via official link. Net ${F(sc.netAllIn)} (${F(sc.netPerHour)}/h; 4% T-bill ref ${F(sc.tbillBench)}).`,`${F(sc.cashFees)} total`,8),
  ];
  return{playKind:kind,steps,boardStrings:steps.map(s=>`${s.when} — ${s.text} Cost: ${s.cost}. Time: ${s.time}.`.slice(0,596))};
 }
